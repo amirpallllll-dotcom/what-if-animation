@@ -9,10 +9,10 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Get repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -24,7 +24,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Install project
+      - name: Install dependencies
         working-directory: studio
         run: npm ci
 
@@ -32,14 +32,14 @@ jobs:
         working-directory: studio
         run: npx remotion browser ensure
 
-      - name: Render Rewind
+      - name: Render video
         working-directory: studio
-        run: npx remotion render src/index.ts Rewind out/Rewind.mp4
+        run: npx remotion render src/index.ts rewind out/rewind.mp4
 
-      - name: Upload MP4
+      - name: Upload video
         uses: actions/upload-artifact@v4
         with:
-          name: Rewind-test-video
-          path: studio/out/Rewind.mp4
+          name: rewind-test-video
+          path: studio/out/rewind.mp4
           if-no-files-found: error
           retention-days: 3
