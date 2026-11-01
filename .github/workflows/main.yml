@@ -32,11 +32,11 @@ jobs:
         working-directory: studio
         run: npx remotion browser ensure
 
-      - name: Render video
+      - name: Render Rewind
         working-directory: studio
-        run: npx remotion render src/index.ts rewind out/rewind.mp4
+        run: npx remotion render src/index.ts Rewind out/rewind.mp4
 
-      - name: Upload video
+      - name: Upload MP4
         uses: actions/upload-artifact@v4
         with:
           name: rewind-test-video
