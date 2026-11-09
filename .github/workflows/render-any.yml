@@ -1,5 +1,4 @@
 name: Render any episode
-
 on:
   workflow_dispatch:
     inputs:
@@ -9,28 +8,23 @@ on:
       comp:
         description: "episode name"
         default: "DossierDemo"
-
 jobs:
   render:
     runs-on: ubuntu-latest
     timeout-minutes: 180
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: studio/package-lock.json
-
       - name: Install FFmpeg
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-
       - name: Add the episode
         run: |
           rm -rf pkg_in
@@ -39,19 +33,17 @@ jobs:
           cd pkg_in
           sed "s#S=/workspace/studio#S=$GITHUB_WORKSPACE/studio#" install.sh > i.sh
           sh i.sh
-
+      - name: Overwrite with the fixed shots file
+        run: cp vetfix/shots.tsx studio/src/episodes/vet/shots.tsx
       - name: Install dependencies
         working-directory: studio
         run: npm ci
-
       - name: Prepare browser
         working-directory: studio
         run: npx remotion browser ensure
-
       - name: Render
         working-directory: studio
         run: npx remotion render src/index.ts "${{ github.event.inputs.comp }}" out/video.mp4 --concurrency=2 --timeout=120000
-
       - name: Upload MP4
         uses: actions/upload-artifact@v4
         with:
