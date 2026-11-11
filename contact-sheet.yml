@@ -1,0 +1,128 @@
+name: Contact sheets (one still per shot)
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: "zip file in the repo root"
+        default: "vet_full.zip"
+      comp:
+        description: "composition (must exist in timelines.json)"
+        default: "VetFull"
+
+jobs:
+  sheets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+
+      - name: Add the episodes
+        run: |
+          rm -rf pkg_in
+          mkdir pkg_in
+          unzip -o "${{ github.event.inputs.zip }}" -d pkg_in
+          cd pkg_in
+          sed "s#S=/workspace/studio#S=$GITHUB_WORKSPACE/studio#" install.sh > i.sh
+          sh i.sh
+
+      - name: Install dependencies
+        working-directory: studio
+        run: |
+          npm ci
+          npm i --no-save @remotion/bundler@4.0.530 @remotion/renderer@4.0.530
+
+      - name: Prepare browser
+        working-directory: studio
+        run: npx remotion browser ensure
+
+      - name: Render one still per shot
+        working-directory: studio
+        env:
+          COMP: ${{ github.event.inputs.comp }}
+        run: |
+          cat > stills.mjs << 'EOF'
+          import path from 'path';
+          import fs from 'fs';
+          import {bundle} from '@remotion/bundler';
+          import {renderStill, selectComposition} from '@remotion/renderer';
+
+          const COMP = process.env.COMP;
+          const all = JSON.parse(fs.readFileSync('src/episodes/vet/timelines.json', 'utf8'));
+          const tl = all[COMP];
+          if (!tl) { console.error('composition not found in timelines.json: ' + COMP); process.exit(1); }
+
+          fs.mkdirSync('out/stills', {recursive: true});
+          const serveUrl = await bundle({entryPoint: path.resolve('src/index.ts')});
+          const composition = await selectComposition({serveUrl, id: COMP});
+
+          const manifest = [];
+          let i = 0;
+          for (const s of tl.segments) {
+            const len = s.b - s.a;
+            const frame = Math.min(composition.durationInFrames - 1, s.a + Math.min(60, Math.floor(len * 0.7)));
+            const out = `out/stills/${String(i).padStart(3, '0')}.jpg`;
+            let ok = true;
+            try {
+              await renderStill({composition, serveUrl, output: out, frame, imageFormat: 'jpeg', jpegQuality: 80, scale: 0.5, timeoutInMilliseconds: 120000});
+            } catch (e) {
+              ok = false;
+              console.error('FAILED shot ' + s.shot + ': ' + e.message);
+            }
+            manifest.push({i, shot: s.shot, frame, a: s.a, b: s.b, line: s.line || '', file: out, ok});
+            console.log('done ' + i + ' ' + s.shot);
+            i++;
+          }
+          fs.writeFileSync('out/stills/manifest.json', JSON.stringify(manifest));
+          EOF
+          node stills.mjs
+
+      - name: Build contact sheets
+        run: |
+          pip install pillow
+          mkdir -p sheets
+          cat > sheet.py << 'EOF'
+          import json, os, textwrap
+          from PIL import Image, ImageDraw, ImageFont
+
+          m = json.load(open('studio/out/stills/manifest.json'))
+          fb = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+          fr = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+          F1 = ImageFont.truetype(fb, 22)
+          F2 = ImageFont.truetype(fr, 20)
+          W, H, CAP, COLS, ROWS = 640, 360, 60, 3, 4
+          PER = COLS * ROWS
+          for n, s in enumerate(range(0, len(m), PER)):
+              sheet = Image.new('RGB', (COLS * W, ROWS * (H + CAP)), (18, 18, 24))
+              d = ImageDraw.Draw(sheet)
+              for j, e in enumerate(m[s:s + PER]):
+                  r, c = divmod(j, COLS)
+                  x, y = c * W, r * (H + CAP)
+                  p = os.path.join('studio', e['file'])
+                  if e['ok'] and os.path.exists(p):
+                      sheet.paste(Image.open(p).convert('RGB').resize((W, H)), (x, y))
+                  else:
+                      d.rectangle([x, y, x + W, y + H], fill=(90, 20, 20))
+                      d.text((x + 20, y + 150), 'RENDER FAILED', fill=(255, 255, 255), font=F1)
+                  d.text((x + 6, y + H + 4), f"#{e['i'] + 1}  {e['shot']}  {e['a'] / 30:.1f}s", fill=(255, 205, 70), font=F1)
+                  d.text((x + 6, y + H + 32), textwrap.shorten(e['line'], width=46, placeholder='...'), fill=(230, 230, 230), font=F2)
+              sheet.save(f'sheets/sheet_{n + 1:02d}.png')
+          print('sheets:', n + 1)
+          EOF
+          python3 sheet.py
+
+      - name: Upload sheets
+        uses: actions/upload-artifact@v4
+        with:
+          name: contact-sheets
+          path: sheets/*.png
+          if-no-files-found: error
+          retention-days: 7
