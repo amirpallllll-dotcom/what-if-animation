@@ -1,0 +1,108 @@
+name: Contact sheets
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: "zip file in the repo root"
+        default: "vet_full.zip"
+      comp:
+        description: "episode name"
+        default: "VetFull"
+
+jobs:
+  sheets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Add the episodes
+        run: |
+          rm -rf pkg_in
+          mkdir pkg_in
+          unzip -o "${{ github.event.inputs.zip }}" -d pkg_in
+          cd pkg_in
+          sed "s#S=/workspace/studio#S=$GITHUB_WORKSPACE/studio#" install.sh > i.sh
+          sh i.sh
+
+      - name: Install dependencies
+        working-directory: studio
+        run: npm ci
+
+      - name: Prepare browser
+        working-directory: studio
+        run: npx remotion browser ensure
+
+      - name: Render one still per shot
+        working-directory: studio
+        run: |
+          mkdir -p stills
+          cat > stills.mjs <<'JS'
+          import fs from 'fs';
+          import path from 'path';
+          import { bundle } from '@remotion/bundler';
+          import { renderStill, selectComposition } from '@remotion/renderer';
+          const comp = process.env.COMP;
+          const tl = JSON.parse(fs.readFileSync('src/episodes/vet/timelines.json', 'utf8'))[comp];
+          const serveUrl = await bundle({ entryPoint: path.resolve('src/index.ts') });
+          const composition = await selectComposition({ serveUrl, id: comp });
+          for (const s of tl.segments) {
+            const key = Math.min(30, Math.floor((s.b - s.a) / 2));
+            await renderStill({ composition, serveUrl, frame: s.a + key, output: `stills/${s.shot}.png` });
+            console.log('ok', s.shot);
+          }
+          JS
+          COMP="${{ github.event.inputs.comp }}" node stills.mjs
+
+      - name: Build contact sheets
+        working-directory: studio
+        run: |
+          pip install pillow
+          cat > sheet.py <<'PY'
+          import json, os
+          from PIL import Image, ImageDraw, ImageFont
+          comp = os.environ['COMP']
+          segs = json.load(open('src/episodes/vet/timelines.json'))[comp]['segments']
+          W, H, COLS, ROWS = 640, 360, 3, 4
+          try:
+              F = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf', 22)
+          except Exception:
+              F = ImageFont.load_default()
+          os.makedirs('out', exist_ok=True)
+          per = COLS * ROWS
+          for n in range(0, len(segs), per):
+              sheet = Image.new('RGB', (W * COLS, (H + 60) * ROWS), (20, 20, 24))
+              d = ImageDraw.Draw(sheet)
+              for i, s in enumerate(segs[n:n + per]):
+                  p = 'stills/' + s['shot'] + '.png'
+                  x, y = (i % COLS) * W, (i // COLS) * (H + 60)
+                  if os.path.exists(p):
+                      sheet.paste(Image.open(p).convert('RGB').resize((W, H)), (x, y))
+                  else:
+                      d.text((x + 10, y + 10), 'NO IMAGE', font=F, fill=(255, 80, 80))
+                  d.text((x + 6, y + H + 4), s['shot'] + '  ' + str(round(s['a'] / 30, 1)) + 's', font=F, fill=(255, 215, 74))
+                  d.text((x + 6, y + H + 32), s['line'][:44], font=F, fill=(230, 230, 230))
+              sheet.save('out/sheet_' + str(n // per + 1).zfill(2) + '.jpg', quality=82)
+          PY
+          COMP="${{ github.event.inputs.comp }}" python sheet.py
+
+      - name: Upload sheets
+        uses: actions/upload-artifact@v4
+        with:
+          name: contact-sheets
+          path: studio/out/sheet_*.jpg
+          if-no-files-found: error
