@@ -1,0 +1,47 @@
+name: Whisper words
+
+on:
+  workflow_dispatch:
+
+jobs:
+  words:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install faster-whisper
+        run: pip install faster-whisper
+
+      - name: Transcribe
+        run: |
+          ls *.mp3
+          mkdir -p out
+          python - <<'PY'
+          import glob, json
+          from faster_whisper import WhisperModel
+          m = WhisperModel("small", device="cpu", compute_type="int8")
+          res = {}
+          for f in sorted(glob.glob("*.mp3")):
+              segs, _ = m.transcribe(f, language="en", word_timestamps=True)
+              words = []
+              for s in segs:
+                  for w in s.words:
+                      words.append([round(w.start, 2), round(w.end, 2), w.word.strip()])
+              res[f] = words
+              print(f, len(words), "words")
+          json.dump(res, open("out/words.json", "w"))
+          PY
+
+      - name: Upload words
+        uses: actions/upload-artifact@v4
+        with:
+          name: words-json
+          path: out/words.json
+          if-no-files-found: error
