@@ -1,0 +1,247 @@
+name: Measure video
+
+on:
+  workflow_dispatch:
+    inputs:
+      video:
+        description: "video file name in the repo root (example: reference.mp4)"
+        default: "reference.mp4"
+      ranges:
+        description: "optional, seconds to see at 10 frames per second, example: 33-36,48-50 (max 12 s each)"
+        default: ""
+      words:
+        description: "also get the time of every spoken word? (true or false)"
+        default: "false"
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python3 -m pip install pillow
+
+      - name: Measure
+        run: |
+          cat > measure.py <<'PYEOF'
+          import subprocess, sys, os, re, json, math, array, shutil
+          from PIL import Image, ImageDraw
+
+          V = sys.argv[1]
+          RANGES = sys.argv[2] if len(sys.argv) > 2 else ''
+          OUT = 'measure_out'
+          SH = OUT + '/sheets'
+          TMP = 'measure_tmp'
+          for d in (OUT, SH, TMP):
+              os.makedirs(d, exist_ok=True)
+
+          def run(cmd):
+              return subprocess.run(cmd, capture_output=True, text=True)
+
+          def ts(t):
+              m = int(t // 60)
+              return f'{m}:{t - 60 * m:05.2f}'
+
+          lines = []
+          def w(s=''):
+              lines.append(s)
+
+          # 1. file facts
+          p = run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration:stream=codec_type,width,height,r_frame_rate', '-of', 'json', V])
+          info = json.loads(p.stdout)
+          dur = float(info['format']['duration'])
+          vs = [s for s in info['streams'] if s['codec_type'] == 'video'][0]
+          has_audio = any(s['codec_type'] == 'audio' for s in info['streams'])
+          num, den = vs['r_frame_rate'].split('/')
+          fps = float(num) / float(den) if float(den) else 30.0
+          w('=== MEASURED REPORT (made by ffmpeg, no guessing) ===')
+          w(f'file: {V}')
+          w(f'duration: {dur:.2f} s | size: {vs["width"]}x{vs["height"]} | fps: {fps:.2f} | audio track: {"yes" if has_audio else "no"}')
+          w('NOTE: if the video is a screen recording, black side bars / player UI are not part of the animation.')
+          w()
+
+          # 2. cuts and soft changes
+          def scenes(th):
+              p = run(['ffmpeg', '-hide_banner', '-i', V, '-vf', f"select='gt(scene,{th})',metadata=print:file=-", '-an', '-f', 'null', '-'])
+              res = []
+              cur = None
+              for ln in p.stdout.splitlines():
+                  m = re.search(r'pts_time:([0-9.]+)', ln)
+                  if m:
+                      cur = float(m.group(1))
+                  m = re.search(r'lavfi.scene_score=([0-9.]+)', ln)
+                  if m and cur is not None:
+                      res.append((cur, float(m.group(1))))
+                      cur = None
+              return res
+
+          hard = scenes(0.14)
+          soft = [s for s in scenes(0.06) if all(abs(s[0] - h[0]) > 0.15 for h in hard)]
+          w(f'HARD CUTS (scene score > 0.14): {len(hard)}')
+          prev = 0.0
+          for i, (t, sc) in enumerate(hard, 1):
+              w(f'  cut {i:02d} at {ts(t)} (score {sc:.2f}) | previous shot lasted {t - prev:.2f} s')
+              prev = t
+          w(f'  last shot: {prev:.2f} s -> {dur:.2f} s ({dur - prev:.2f} s)')
+          if hard:
+              lens = [b[0] - a for a, b in zip([0.0] + [h[0] for h in hard], hard)] + [dur - hard[-1][0]]
+              w(f'  shot length: mean {sum(lens) / len(lens):.2f} s | shortest {min(lens):.2f} s | longest {max(lens):.2f} s | cuts per minute {len(hard) / dur * 60:.1f}')
+          w()
+          w(f'SOFT CHANGES (score 0.06-0.14: zooms, whips, dissolves, fast motion, flashes; NOT sure they are cuts): {len(soft)}')
+          for t, sc in soft[:80]:
+              w(f'  {ts(t)} (score {sc:.2f})')
+          w()
+
+          # 3. loudness
+          if has_audio:
+              raw = TMP + '/a.raw'
+              run(['ffmpeg', '-y', '-v', 'error', '-i', V, '-vn', '-ac', '1', '-ar', '8000', '-f', 's16le', raw])
+              a = array.array('h')
+              with open(raw, 'rb') as f:
+                  a.frombytes(f.read())
+              win = 800  # 0.1 s
+              db = []
+              for i in range(0, len(a) - win + 1, win):
+                  seg = a[i:i + win]
+                  r = math.sqrt(sum(x * x for x in seg) / win) / 32768.0
+                  db.append(20 * math.log10(r) if r > 1e-6 else -90.0)
+              w('LOUDNESS (RMS dBFS, 0.1 s windows; -90 = digital silence). One value per second (max of that second):')
+              row = []
+              for s in range(0, len(db), 10):
+                  row.append(f'{s // 10}s:{max(db[s:s + 10]):.0f}')
+              for i in range(0, len(row), 10):
+                  w('  ' + ' | '.join(row[i:i + 10]))
+              w()
+              quiet = []
+              cur = None
+              for i, v in enumerate(db):
+                  if v < -45:
+                      cur = i if cur is None else cur
+                  else:
+                      if cur is not None and i - cur >= 3:
+                          quiet.append((cur / 10, i / 10))
+                      cur = None
+              w('QUIET MOMENTS (below -45 dB for 0.3 s or more):')
+              for a0, b0 in quiet:
+                  w(f'  {ts(a0)} -> {ts(b0)} ({b0 - a0:.1f} s)')
+              if not quiet:
+                  w('  none')
+              w()
+              jumps = []
+              for i in range(3, len(db) - 3):
+                  d = sum(db[i:i + 3]) / 3 - sum(db[i - 3:i]) / 3
+                  if abs(d) > 15 and (not jumps or i / 10 - jumps[-1][0] > 0.5):
+                      jumps.append((i / 10, d))
+              w('SUDDEN LEVEL JUMPS (probably a sound effect or music hit; change over 15 dB):')
+              for t, d in jumps[:40]:
+                  w(f'  {ts(t)} {"louder" if d > 0 else "quieter"} by {abs(d):.0f} dB')
+              if not jumps:
+                  w('  none')
+              w()
+
+          # 4. frames
+          def grab(times, size):
+              paths = []
+              for i, t in enumerate(times):
+                  pth = f'{TMP}/f_{len(os.listdir(TMP)):05d}.jpg'
+                  run(['ffmpeg', '-y', '-v', 'error', '-ss', f'{max(t, 0):.3f}', '-i', V, '-frames:v', '1', '-vf', f'scale={size}:-2', pth])
+                  paths.append(pth if os.path.exists(pth) else None)
+              return paths
+
+          def sheet(items, cols, tile_w, name):
+              ims = [(Image.open(p), lab) for p, lab in items if p]
+              if not ims:
+                  return
+              tw = tile_w
+              th = int(ims[0][0].height * tw / ims[0][0].width)
+              rows = (len(ims) + cols - 1) // cols
+              sh = Image.new('RGB', (tw * cols, th * rows), 'black')
+              d = ImageDraw.Draw(sh)
+              for i, (im, lab) in enumerate(ims):
+                  x, y = (i % cols) * tw, (i // cols) * th
+                  sh.paste(im.resize((tw, th)), (x, y))
+                  d.rectangle([x, y, x + 78, y + 18], fill='black')
+                  d.text((x + 3, y + 4), lab, fill='yellow')
+              sh.save(f'{SH}/{name}.jpg', quality=82)
+
+          w('SHEETS (images in the sheets folder; each tile is labelled with its time in seconds):')
+          n = 0
+          times = [i * 0.5 for i in range(int(dur / 0.5) + 1)]
+          per = 24
+          for s in range(0, len(times), per):
+              chunk = times[s:s + per]
+              paths = grab(chunk, 480)
+              n += 1
+              name = f'overview_{n:02d}'
+              sheet([(p, f'{t:.1f}s') for p, t in zip(paths, chunk)], 4, 480, name)
+              w(f'  {name}.jpg: whole video every 0.5 s, from {chunk[0]:.1f}s to {chunk[-1]:.1f}s')
+
+          # dense sheets around every hard cut (10 fps)
+          cutlist = [t for t, _ in hard][:36]
+          group = 6
+          for g in range(0, len(cutlist), group):
+              rows = cutlist[g:g + group]
+              items = []
+              for t in rows:
+                  tt = [t - 0.3 + 0.1 * k for k in range(9)]
+                  pp = grab(tt, 240)
+                  items += [(p, f'{x:.1f}s') for p, x in zip(pp, tt)]
+              name = f'cuts_{g // group + 1:02d}'
+              sheet(items, 9, 240, name)
+              w(f'  {name}.jpg: 10 frames per second around cuts at ' + ', '.join(f'{t:.1f}s' for t in rows) + ' (one row per cut, from 0.3 s before to 0.5 s after)')
+
+          # dense sheets for requested ranges
+          for r in [x.strip() for x in RANGES.split(',') if x.strip()]:
+              try:
+                  a0, b0 = [float(x) for x in r.split('-')]
+              except Exception:
+                  continue
+              b0 = min(b0, a0 + 12)
+              tt = [a0 + 0.1 * k for k in range(int((b0 - a0) / 0.1) + 1)]
+              pp = grab(tt, 300)
+              for part in range(0, len(tt), 40):
+                  name = f'range_{a0:g}-{b0:g}_{part // 40 + 1}'
+                  sheet([(p, f'{x:.1f}s') for p, x in zip(pp[part:part + 40], tt[part:part + 40])], 8, 300, name)
+                  w(f'  {name}.jpg: 10 frames per second from {tt[part]:.1f}s to {tt[min(part + 39, len(tt) - 1)]:.1f}s')
+
+          w()
+          w('HOW TO READ: cut times and sound numbers above are measured facts. What happens inside the pictures must be read from the sheets.')
+          open(OUT + '/report.txt', 'w').write('\n'.join(lines))
+          shutil.rmtree(TMP, ignore_errors=True)
+          print('done', len(lines), 'lines')
+
+          PYEOF
+          python3 measure.py "${{ github.event.inputs.video }}" "${{ github.event.inputs.ranges }}"
+
+      - name: Word times (optional)
+        if: ${{ github.event.inputs.words == 'true' }}
+        continue-on-error: true
+        run: |
+          python3 -m pip install faster-whisper
+          cat > words.py <<'PYEOF'
+          import sys, json
+          from faster_whisper import WhisperModel
+          m = WhisperModel("base", device="cpu", compute_type="int8")
+          segs, _ = m.transcribe(sys.argv[1], word_timestamps=True, language="en")
+          out = []
+          for s in segs:
+              for w in s.words:
+                  out.append("[%.2f-%.2f] %s" % (w.start, w.end, w.word.strip()))
+          open("measure_out/words.txt", "w").write("\n".join(out))
+          print(len(out), "words")
+          PYEOF
+          python3 words.py "${{ github.event.inputs.video }}"
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: measure-report
+          path: measure_out/
+          if-no-files-found: error
+          retention-days: 7
