@@ -1,4 +1,3 @@
-
 name: Blender Character Animation Test
 
 on:
@@ -26,7 +25,9 @@ jobs:
 
       - name: Render character animation
         run: |
-          blender --background --python experiments/blender-grease-pencil-test/create_test.py
+          blender --background --python-exit-code 1 --python experiments/blender-grease-pencil-test/create_test.py
+          test -s /tmp/blender_test.mp4
+          ls -lh /tmp/blender_test.mp4
 
       - name: Upload rendered video
         uses: actions/upload-artifact@v4
