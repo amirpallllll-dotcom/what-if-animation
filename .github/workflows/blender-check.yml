@@ -1,0 +1,18 @@
+name: Blender Availability Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  blender-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Blender
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y blender
+
+      - name: Verify Blender
+        run: |
+          blender --version
+          blender --background --python-expr "import bpy; print('BLENDER_PYTHON_OK'); print('Blender version:', bpy.app.version_string)"
