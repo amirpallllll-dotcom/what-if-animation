@@ -1,0 +1,49 @@
+name: Animation Learning Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: studio/package-lock.json
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install dependencies
+        working-directory: studio
+        run: npm ci
+
+      - name: Check TypeScript
+        working-directory: studio
+        run: npm run typecheck
+
+      - name: Prepare browser
+        working-directory: studio
+        run: npx remotion browser ensure
+
+      - name: Render test
+        working-directory: studio
+        run: npx remotion render src/index.ts AnimationLearningTest out/animation-learning-test.mp4 --concurrency=2 --timeout=120000
+
+      - name: Upload video
+        uses: actions/upload-artifact@v4
+        with:
+          name: animation-learning-test
+          path: studio/out/animation-learning-test.mp4
+          if-no-files-found: error
+          retention-days: 7
