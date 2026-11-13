@@ -1,14 +1,20 @@
-name: Blender Availability Test
+
+name: Blender Character Animation Test
 
 on:
   push:
     branches:
       - experiment/blender-grease-pencil-test
   workflow_dispatch:
+
 jobs:
-  blender-check:
+  blender-render:
     runs-on: ubuntu-latest
+
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Install Blender
         run: |
           sudo apt-get update
@@ -17,4 +23,14 @@ jobs:
       - name: Verify Blender
         run: |
           blender --version
-          blender --background --python-expr "import bpy; print('BLENDER_PYTHON_OK'); print('Blender version:', bpy.app.version_string)"
+
+      - name: Render character animation
+        run: |
+          blender --background --python experiments/blender-grease-pencil-test/create_test.py
+
+      - name: Upload rendered video
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-character-test
+          path: /tmp/blender_test.mp4
+          if-no-files-found: error
