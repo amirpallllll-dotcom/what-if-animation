@@ -1,8 +1,10 @@
 name: Blender Availability Test
 
 on:
+  push:
+    branches:
+      - experiment/blender-grease-pencil-test
   workflow_dispatch:
-
 jobs:
   blender-check:
     runs-on: ubuntu-latest
