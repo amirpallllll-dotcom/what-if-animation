@@ -1,3 +1,4 @@
+
 name: Blender Character Animation Test
 
 on:
@@ -14,14 +15,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Blender
+      - name: Install Blender and graphics libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y blender
+          sudo apt-get install -y blender libegl1 libgl1
 
-      - name: Verify Blender
+      - name: Verify Blender and EGL
         run: |
           blender --version
+          ldconfig -p | grep libEGL.so.1
 
       - name: Render character animation
         run: |
