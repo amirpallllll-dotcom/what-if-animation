@@ -1,0 +1,186 @@
+name: Check video against plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      video:
+        description: "rendered video in the repo root (example: miller.mp4)"
+        default: "miller.mp4"
+      zip:
+        description: "the package zip in the repo root"
+        default: "vet_full2.zip"
+      comp:
+        description: "episode name inside the package (example: Miller)"
+        default: "Miller"
+      words:
+        description: "also check voice against cuts? (true or false, needs a video with voice)"
+        default: "false"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Get the plan out of the zip
+        run: |
+          rm -rf pkg_chk && mkdir pkg_chk && unzip -o -q "${{ github.event.inputs.zip }}" 'episode/*.json' -d pkg_chk
+          python3 - <<'PYEOF'
+          import json, glob
+          comp = "${{ github.event.inputs.comp }}"
+          tl = None
+          for f in glob.glob('pkg_chk/episode/timelines*.json'):
+              d = json.load(open(f))
+              if comp in d: tl = d[comp]
+          assert tl, 'episode not found in the zip'
+          json.dump(tl, open('plan_timeline.json', 'w'))
+          sp = {}
+          for f in glob.glob('pkg_chk/episode/specs*.json'):
+              sp.update(json.load(open(f)))
+          json.dump(sp, open('plan_specs.json', 'w'))
+          print('plan ok:', len(tl['segments']), 'shots')
+          PYEOF
+
+      - name: Voice word times (optional)
+        if: ${{ github.event.inputs.words == 'true' }}
+        continue-on-error: true
+        run: |
+          python3 -m pip install faster-whisper
+          python3 - <<'PYEOF'
+          import json
+          from faster_whisper import WhisperModel
+          m = WhisperModel("base", device="cpu", compute_type="int8")
+          segs, _ = m.transcribe("${{ github.event.inputs.video }}", word_timestamps=True, language="en")
+          out = [{"word": w.word.strip(), "start": w.start, "end": w.end} for s in segs for w in s.words]
+          json.dump(out, open("words.json", "w"))
+          print(len(out), "words")
+          PYEOF
+
+      - name: Check
+        run: |
+          cat > check.py <<'PYEOF'
+          # check.py VIDEO TIMELINE.json [SPECS.json] [WORDS.json]
+          # Compares the rendered video with the plan. Facts only: planned cuts vs real cuts, frozen shots, people off screen, voice vs cut sync.
+          import subprocess, sys, json, re, os
+          V, TL = sys.argv[1], sys.argv[2]
+          SP = sys.argv[3] if len(sys.argv) > 3 and os.path.exists(sys.argv[3]) else None
+          WD = sys.argv[4] if len(sys.argv) > 4 and os.path.exists(sys.argv[4]) else None
+          tl = json.load(open(TL))
+          fps = tl.get('fps', 30)
+          segs = tl['segments']
+          out = []
+          def w(s=''): out.append(s)
+          def run(c): return subprocess.run(c, capture_output=True, text=True)
+
+          # 0. can we read the video at all?
+          pr = run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration,size:stream=codec_type', '-of', 'json', V])
+          try:
+              info = json.loads(pr.stdout); vdur = float(info['format']['duration']); assert any(x.get('codec_type') == 'video' for x in info['streams'])
+          except Exception:
+              sz = os.path.getsize(V) if os.path.exists(V) else -1
+              print(f'ERROR: cannot read "{V}" as a video (file size: {sz} bytes; -1 = file not found). Upload the real video.mp4 renamed to the name you typed, in the repo root, not the zip.')
+              sys.exit(1)
+          plan_len = segs[-1]['b'] / fps
+          print(f'video length {vdur:.1f}s, planned {plan_len:.1f}s' + ('  <-- LENGTH DIFFERS' if abs(vdur - plan_len) > 1 else ''))
+          # 1. real cuts from the video
+          p = run(['ffmpeg', '-hide_banner', '-i', V, '-vf', "select='gt(scene,0.14)',metadata=print:file=-", '-an', '-f', 'null', '-'])
+          real = sorted(set(round(float(m), 2) for m in re.findall(r'pts_time:([\d.]+)', p.stdout)))
+          planned = [(s['shot'], s['a'] / fps) for s in segs[1:]]
+          w('=== CHECK REPORT (script, facts only) ===')
+          w(f'planned shots: {len(segs)} | planned cuts: {len(planned)} | cuts found in video: {len(real)}')
+          w()
+          w('1) PLANNED CUT vs REAL CUT (OK = within 0.15 s)')
+          used = set()
+          bad = 0
+          for sid, t in planned:
+              near = min(real, key=lambda r: abs(r - t)) if real else None
+              if near is not None and abs(near - t) <= 0.15:
+                  used.add(near); w(f'  OK      {sid:6s} planned {t:6.2f}s  real {near:6.2f}s')
+              elif near is not None and abs(near - t) <= 1.0:
+                  used.add(near); bad += 1; w(f'  LATE/EARLY {sid:6s} planned {t:6.2f}s  nearest real {near:6.2f}s  ({near - t:+.2f}s)')
+              else:
+                  bad += 1; w(f'  NO CUT  {sid:6s} planned {t:6.2f}s  (two shots look too alike, or the cut is missing)')
+          extra = [r for r in real if r not in used]
+          w(f'  extra cuts not in the plan: {[round(e, 2) for e in extra]}  (can be flash/shake effects, normal if few)')
+          w()
+
+          # 2. frozen shots (no change at all inside a shot)
+          def frame_diffs(t0, t1):
+              n = max(2, int((t1 - t0) * 6))
+              r = subprocess.run(['ffmpeg', '-hide_banner', '-v', 'error', '-ss', f'{t0:.3f}', '-t', f'{t1 - t0:.3f}', '-i', V, '-vf', 'fps=6,scale=96:54,format=gray', '-f', 'rawvideo', '-'], capture_output=True)
+              d = r.stdout; sz = 96 * 54
+              fr = [d[i:i + sz] for i in range(0, len(d) - sz + 1, sz)]
+              if len(fr) < 2: return None
+              tot = 0
+              for a, b in zip(fr, fr[1:]):
+                  tot += sum(abs(x - y) for x, y in zip(a, b)) / sz
+              return tot / (len(fr) - 1)
+          w('2) MOTION INSIDE EACH SHOT (mean pixel change; under 0.25 for 1.5 s or more = frozen, add a camera move, caption or shake)')
+          frozen = 0
+          for s in segs:
+              t0, t1 = s['a'] / fps + 0.1, s['b'] / fps - 0.1
+              if t1 - t0 < 1.0: continue
+              m = frame_diffs(t0, t1)
+              if m is None: continue
+              flag = 'FROZEN' if (m < 0.25 and t1 - t0 >= 1.5) else 'ok'
+              if flag == 'FROZEN': frozen += 1
+              w(f'  {flag:6s} {s["shot"]:6s} {t1 - t0:4.1f}s  motion {m:5.2f}')
+          w()
+
+          # 3. people off screen (from the plan, camera included)
+          if SP:
+              spec = json.load(open(SP))
+              w('3) PEOPLE OFF SCREEN (screen x = 960 + (x - cam_x) * zoom; safe zone 80..1840)')
+              off = 0
+              for s in segs:
+                  sp = spec.get(s['shot'])
+                  if not sp: continue
+                  cam = sp.get('cam', {}); z = cam.get('z', [1.0, 1.06]); cx = cam.get('cx', [960, 960])
+                  for k, label in ((0, 'start'), (1, 'end')):
+                      for i, p in enumerate(sp.get('people', [])):
+                          x = p['x'] + (p.get('speed', 0) * (s['b'] - s['a']) * p.get('face', 1) if k and p.get('act') in ('walk', 'run', 'carry') else 0)
+                          sx = 960 + (x - cx[k]) * z[k]
+                          if sx < 80 or sx > 1840:
+                              off += 1; w(f'  OFF    {s["shot"]:6s} person {i} at {label}: screen x {sx:6.0f}')
+              w(f'  people off screen: {off}')
+              w()
+
+          # 4. voice vs cut sync
+          if WD:
+              words = json.load(open(WD))
+              norm = lambda x: re.sub(r'[^a-z0-9]', '', x.lower())
+              ptr = 0
+              w('4) VOICE vs CUT (first spoken word of the line vs the shot start; good = the word starts 0.0 to 0.25 s after the cut)')
+              for s in segs:
+                  line = s.get('line') or ''
+                  fw = norm(line.split()[0]) if line.split() else ''
+                  j = next((i for i in range(ptr, len(words)) if norm(words[i]['word']) == fw), None)
+                  if j is None:
+                      w(f'  ?      {s["shot"]:6s} first word "{fw}" not found in speech'); continue
+                  ptr = j + 1
+                  off = words[j]['start'] - s['a'] / fps
+                  flag = 'ok' if -0.05 <= off <= 0.3 else ('EARLY' if off < -0.05 else 'LATE')
+                  w(f'  {flag:6s} {s["shot"]:6s} word "{fw}" starts {off:+.2f}s after the cut')
+              w()
+          w(f'SUMMARY: cut problems {bad}, frozen shots {frozen}')
+          os.makedirs('check_out', exist_ok=True)
+          open('check_out/report.txt', 'w').write('\n'.join(out))
+          print('\n'.join(out))
+
+          PYEOF
+          python3 check.py "${{ github.event.inputs.video }}" plan_timeline.json plan_specs.json words.json
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-report
+          path: check_out/
+          if-no-files-found: error
+          retention-days: 7
