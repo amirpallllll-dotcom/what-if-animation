@@ -21,14 +21,14 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Download Stick engine
         run: |
           git clone https://github.com/hmelberg/stick.git /tmp/stick
           git -C /tmp/stick checkout 698e9a783eb2b9e58a762311f8da0670a1528cba
 
-      - name: Install Playwright
+      - name: Install Playwright and Chromium
         run: |
           mkdir -p /tmp/playwright-env
           cd /tmp/playwright-env
@@ -51,18 +51,22 @@ jobs:
 
       - name: Capture browser frames
         run: |
-          mkdir -p artifacts
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
 
           cat > /tmp/playwright-env/stick-test.mjs <<'EOF'
           import { chromium } from 'playwright';
 
           const browser = await chromium.launch({ headless: true });
+
           const page = await browser.newPage({
             viewport: { width: 1280, height: 800 }
           });
 
           const errors = [];
-          page.on('pageerror', error => errors.push(error.message));
+
+          page.on('pageerror', error => {
+            errors.push(error.message);
+          });
 
           try {
             await page.goto(
@@ -71,7 +75,12 @@ jobs:
             );
 
             const stage = page.locator('#stage');
-            await stage.waitFor({ state: 'visible', timeout: 15000 });
+
+            await stage.waitFor({
+              state: 'visible',
+              timeout: 15000
+            });
+
             await page.waitForTimeout(1000);
 
             const markup = await stage.innerHTML();
@@ -81,7 +90,7 @@ jobs:
             }
 
             await stage.screenshot({
-              path: 'artifacts/stick-frame-00.png'
+              path: `${process.env.GITHUB_WORKSPACE}/artifacts/stick-frame-00.png`
             });
 
             const play = page.locator('#btnPlay');
@@ -91,17 +100,22 @@ jobs:
             }
 
             await play.click();
+
             await page.waitForTimeout(1200);
 
             await stage.screenshot({
-              path: 'artifacts/stick-frame-01.png'
+              path: `${process.env.GITHUB_WORKSPACE}/artifacts/stick-frame-01.png`
             });
 
-            if (errors.length) {
-              throw new Error(errors.join(' | '));
+            if (errors.length > 0) {
+              throw new Error(
+                'Browser errors: ' + errors.join(' | ')
+              );
             }
 
-            console.log('PASS: Stick loaded and 2 frames captured.');
+            console.log('PASS: Stick loaded in Chromium.');
+            console.log('PASS: SVG stage contains rendered content.');
+            console.log('PASS: Two screenshots captured.');
 
           } finally {
             await browser.close();
@@ -117,4 +131,5 @@ jobs:
         with:
           name: stick-visual-test-frames
           path: artifacts/
-          if-no-files-found: warn
+          if-no-files-found: error
+          retention-days: 7
