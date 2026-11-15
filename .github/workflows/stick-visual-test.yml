@@ -1,5 +1,5 @@
 
-name: Stick Visual Browser Test
+name: Stick Rescue Motion Test
 
 on:
   workflow_dispatch:
@@ -49,17 +49,101 @@ jobs:
           cat /tmp/stick-server.log
           exit 1
 
-      - name: Capture browser frames
+      - name: Generate rescue animation and capture frames
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
 
           cat > /tmp/playwright-env/stick-test.mjs <<'EOF'
           import { chromium } from 'playwright';
 
-          const browser = await chromium.launch({ headless: true });
+          const scene = {
+            v: 1,
+            scene: {
+              theme: 'blank'
+            },
+            figures: [
+              {
+                id: 'rescuer',
+                archetype: ['man'],
+                style: 'ink',
+                pos: { x: 15, y: 70 },
+                mood: 'neutral',
+                facing: 'right'
+              },
+              {
+                id: 'person',
+                archetype: ['man'],
+                style: 'ink',
+                pos: { x: 62, y: 70 },
+                mood: 'sad',
+                facing: 'left',
+                pose: { base: 'lie' }
+              }
+            ],
+            timeline: [
+              {
+                at: 0,
+                cmd: 'scene.caption',
+                args: {
+                  text: 'A rescue begins',
+                  dur: 'normal'
+                }
+              },
+              {
+                at: 0,
+                target: 'rescuer',
+                cmd: 'move',
+                dur: 2.5,
+                args: {
+                  style: 'walk',
+                  to: { x: 42, y: 70 }
+                }
+              },
+              {
+                target: 'rescuer',
+                cmd: 'pose.tween',
+                dur: 0.8,
+                args: {
+                  base: 'crouch'
+                }
+              },
+              {
+                target: 'rescuer',
+                cmd: 'reachTo',
+                dur: 0.8,
+                args: {
+                  hand: 'right',
+                  to: [55, 66]
+                }
+              },
+              {
+                target: 'rescuer',
+                cmd: 'reachTo',
+                dur: 0.6,
+                args: {
+                  hand: 'right'
+                }
+              },
+              {
+                target: 'rescuer',
+                cmd: 'pose.tween',
+                dur: 0.8,
+                args: {
+                  base: 'stand'
+                }
+              }
+            ]
+          };
+
+          const browser = await chromium.launch({
+            headless: true
+          });
 
           const page = await browser.newPage({
-            viewport: { width: 1280, height: 800 }
+            viewport: {
+              width: 1280,
+              height: 800
+            }
           });
 
           const errors = [];
@@ -74,48 +158,73 @@ jobs:
               { waitUntil: 'networkidle' }
             );
 
-            const stage = page.locator('#stage');
+            await page.waitForFunction(
+              () => !!window.StickApp
+            );
 
-            await stage.waitFor({
-              state: 'visible',
-              timeout: 15000
+            await page.evaluate(doc => {
+              window.StickApp.setEditor(JSON.stringify(doc));
+            }, scene);
+
+            await page.locator('#btnRender').click();
+
+            await page.waitForFunction(
+              () => window.StickApp?.state?.rt?.duration > 0
+            );
+
+            await page.evaluate(() => {
+              window.StickApp.setPlaying(false);
             });
 
-            await page.waitForTimeout(1000);
+            const duration = await page.evaluate(
+              () => window.StickApp.state.rt.duration
+            );
 
-            const markup = await stage.innerHTML();
+            console.log('Animation duration:', duration);
 
-            if (!markup || markup.trim().length < 20) {
+            const stage = page.locator('#stage');
+
+            const childCount = await stage.evaluate(
+              el => el.childElementCount
+            );
+
+            if (childCount === 0) {
               throw new Error('SVG stage is empty');
             }
 
-            await stage.screenshot({
-              path: `${process.env.GITHUB_WORKSPACE}/artifacts/stick-frame-00.png`
-            });
+            const samples = [
+              0,
+              0.25,
+              0.50,
+              0.75,
+              1
+            ];
 
-            const play = page.locator('#btnPlay');
+            for (let i = 0; i < samples.length; i++) {
+              const time = duration * samples[i];
 
-            if (!(await play.count())) {
-              throw new Error('Play button not found');
-            }
+              await page.evaluate(t => {
+                window.StickApp.drawAt(t);
+              }, time);
 
-            await play.click();
+              await page.waitForTimeout(150);
 
-            await page.waitForTimeout(1200);
+              await stage.screenshot({
+                path:
+                  `${process.env.GITHUB_WORKSPACE}/artifacts/rescue-frame-${i}.png`
+              });
 
-            await stage.screenshot({
-              path: `${process.env.GITHUB_WORKSPACE}/artifacts/stick-frame-01.png`
-            });
-
-            if (errors.length > 0) {
-              throw new Error(
-                'Browser errors: ' + errors.join(' | ')
+              console.log(
+                `Captured frame ${i} at ${time.toFixed(2)} seconds`
               );
             }
 
-            console.log('PASS: Stick loaded in Chromium.');
-            console.log('PASS: SVG stage contains rendered content.');
-            console.log('PASS: Two screenshots captured.');
+            if (errors.length > 0) {
+              throw new Error(errors.join(' | '));
+            }
+
+            console.log('PASS: Custom rescue scene rendered.');
+            console.log('PASS: Five animation frames captured.');
 
           } finally {
             await browser.close();
@@ -125,11 +234,11 @@ jobs:
           cd /tmp/playwright-env
           node stick-test.mjs
 
-      - name: Upload screenshots
+      - name: Upload rescue animation frames
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stick-visual-test-frames
+          name: stick-rescue-motion-frames
           path: artifacts/
           if-no-files-found: error
           retention-days: 7
