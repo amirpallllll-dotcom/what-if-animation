@@ -28,9 +28,12 @@ jobs:
           git clone https://github.com/hmelberg/stick.git /tmp/stick
           git -C /tmp/stick checkout 698e9a783eb2b9e58a762311f8da0670a1528cba
 
-      - name: Install Playwright and Chromium
+      - name: Install Playwright
         run: |
-          npm install --no-save playwright
+          mkdir -p /tmp/playwright-env
+          cd /tmp/playwright-env
+          npm init -y
+          npm install playwright
           npx playwright install --with-deps chromium
 
       - name: Start Stick server
@@ -50,7 +53,7 @@ jobs:
         run: |
           mkdir -p artifacts
 
-          cat > /tmp/stick-test.mjs <<'EOF'
+          cat > /tmp/playwright-env/stick-test.mjs <<'EOF'
           import { chromium } from 'playwright';
 
           const browser = await chromium.launch({ headless: true });
@@ -98,16 +101,15 @@ jobs:
               throw new Error(errors.join(' | '));
             }
 
-            console.log(
-              'PASS: Stick loaded in Chromium and 2 frames were captured.'
-            );
+            console.log('PASS: Stick loaded and 2 frames captured.');
 
           } finally {
             await browser.close();
           }
           EOF
 
-          node /tmp/stick-test.mjs
+          cd /tmp/playwright-env
+          node stick-test.mjs
 
       - name: Upload screenshots
         if: always()
